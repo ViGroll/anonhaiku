@@ -128,6 +128,9 @@ def store_posts(conn, posts, thread_id):
         pid = p.get('no')
         if not isinstance(pid, int):
             continue
+        comment = clean_comment(p.get('com', ''))
+    if any(char.isdigit() for char in comment):
+        continue
         cur = conn.execute('INSERT OR IGNORE INTO posts(post_id,thread_id) VALUES(?,?)', (pid, thread_id))
         if not cur.rowcount:
             continue
