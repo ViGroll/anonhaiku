@@ -129,6 +129,11 @@ def store_posts(conn, posts, thread_id):
         if not isinstance(pid, int):
             continue
 
+        # 4chan includes 'tim' for posts with an attached image or file.
+        # Skip those posts completely, even if the attachment was deleted.
+        if 'tim' in p or 'filedeleted' in p or 'filename' in p or 'ext' in p:
+            continue
+
         comment = clean_comment(p.get('com', ''))
         # Reject the whole original comment when it contains a digit.
         if any(char.isdigit() for char in comment):
