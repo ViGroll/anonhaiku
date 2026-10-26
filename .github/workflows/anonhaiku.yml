@@ -1,0 +1,44 @@
+name: Anonhaiku — scan and publish
+
+on:
+  schedule:
+    - cron: '23 * * * *' # hourly UTC; publish windows start 05:00 and 17:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: anonhaiku-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - run: python -m unittest -q
+      - run: python publisher.py --scan --threads 40
+      - name: Save public haiku catalog and pages
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add haikus.sqlite3 docs/index.html docs/archive.html docs/.nojekyll
+          if ! git diff --cached --quiet; then
+            git commit -m 'Publish Anonhaiku update'
+            git push
+          fi
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+      - uses: actions/deploy-pages@v4
