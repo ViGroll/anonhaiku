@@ -1,266 +1,159 @@
-"""Accidental 5-7-5 haiku finder for public /b/ comments.
-
-Requires: pip install pronouncing
-Usage: python scanner.py --demo | python scanner.py --live --threads 8
-"""
+"""Anonhaiku 2.0: ingest every active /b/ thread, with API-safe pacing."""
 from __future__ import annotations
-import argparse
 import html
 from html.parser import HTMLParser
-import json
 import re
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.utils import formatdate
-from pathlib import Path
-from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-
+from urllib.error import HTTPError, URLError
+import json
 import cmudict
-from quality import best_candidates
 
-PRONUNCIATIONS = cmudict.dict()
-
-DB = Path(__file__).with_name('haikus.sqlite3')
 API = 'https://a.4cdn.org/b'
-TOKEN = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)?")
-LINK = re.compile(r'(?i)https?://\S+|www\.\S+')
+WORDS = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)?")
+NUMBERS = re.compile(r'\d')
+URLS = re.compile(r'(?i)https?://\S+|www\.\S+')
+DICT = cmudict.dict()
+ATTACHMENT_FIELDS = ('tim', 'filename', 'ext', 'filedeleted')
 
 class TextParser(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.out = []
-        self.skip = 0
+        self.result=[]; self.depth=0
     def handle_starttag(self, tag, attrs):
-        classes = dict(attrs).get('class', '')
-        if tag in {'script', 'style'} or (tag == 'span' and ('quote' in classes.split() or 'deadlink' in classes.split())) or tag == 'a':
-            self.skip += 1
-        elif tag == 'br':
-            self.out.append(' ')
+        classes = dict(attrs).get('class','').split()
+        if self.depth: self.depth += 1
+        elif tag in ('script','style','a') or (tag=='span' and ('quote' in classes or 'deadlink' in classes)):
+            self.depth=1
+        elif tag in ('br','p','div'): self.result.append(' ')
     def handle_endtag(self, tag):
-        if tag in {'script', 'style', 'span', 'a'} and self.skip:
-            self.skip -= 1
-        elif tag in {'p', 'div'}:
-            self.out.append(' ')
+        if self.depth: self.depth -= 1
+        elif tag in ('p','div'): self.result.append(' ')
     def handle_data(self, data):
-        if not self.skip:
-            self.out.append(data)
+        if not self.depth: self.result.append(data)
 
-def clean_comment(raw: str) -> str:
-    p = TextParser()
-    p.feed(raw or '')
-    s = html.unescape(' '.join(p.out))
-    s = LINK.sub(' ', s)
-    # Collapse boundaries; we deliberately do NOT require original line breaks.
-    return re.sub(r'\s+', ' ', s).strip()
+def clean_comment(raw):
+    parser=TextParser(); parser.feed(raw or '')
+    return re.sub(r'\s+', ' ', html.unescape(' '.join(parser.result))).strip()
 
-def syllables(word: str) -> int | None:
-    word = word.lower().replace('’', "'")
-    phones = PRONUNCIATIONS.get(word, [])
-    if not phones:
-        return None  # Precision first: skip unknown slang for MVP.
-    counts = {sum(any(ch.isdigit() for ch in phoneme) for phoneme in p) for p in phones}
-    return next(iter(counts)) if len(counts) == 1 else None
+def syllables(word):
+    sounds=DICT.get(word.lower().replace('’',"'"), [])
+    counts={sum(any(ch.isdigit() for ch in part) for part in sound) for sound in sounds}
+    return next(iter(counts)) if len(counts)==1 else None
 
-def detect_with_boundaries(text: str, max_results: int = 60):
-    matches = list(TOKEN.finditer(text))
-    words = [m.group() for m in matches]
-    counts = [syllables(w) for w in words]
-    found = []
-    for start in range(len(words)):
-        if counts[start] is None:
-            continue
-        lines = []
-        index = start
-        for target in (5, 7, 5):
-            subtotal, line = 0, []
-            while index < len(words) and len(line) < 12:
-                count = counts[index]
-                if count is None or subtotal + count > target:
-                    break
-                subtotal += count
-                line.append(words[index])
-                index += 1
-                if subtotal == target:
-                    break
-            if subtotal != target:
-                break
-            lines.append(' '.join(line))
-        if len(lines) == 3:
-            result = tuple(lines)
-            before = text[:matches[start].start()].rstrip()
-            after = text[matches[index-1].end():].lstrip()
-            starts = not before or before[-1] in '.!?;:…'
-            ends = not after or after[0] in '.!?;:…'
-            candidate = (result, int(starts), int(ends))
-            if candidate not in found:
-                found.append(candidate)
-                if len(found) >= max_results:
-                    break
-    return found
-
-def detect(text: str, max_results: int = 25):
-    return [lines for lines, _, _ in detect_with_boundaries(text, max_results)]
+def detect_with_boundaries(text, max_results=150):
+    tokens=list(WORDS.finditer(text)); counts=[syllables(t.group()) for t in tokens]
+    result=[]
+    for start in range(len(tokens)):
+        idx=start; lines=[]
+        for target in (5,7,5):
+            total=0; ws=[]
+            while idx<len(tokens) and len(ws)<12 and counts[idx] is not None and total+counts[idx]<=target:
+                total+=counts[idx]; ws.append(tokens[idx].group()); idx+=1
+                if total==target: break
+            if total != target: break
+            lines.append(' '.join(ws))
+        if len(lines)==3:
+            before=text[:tokens[start].start()].rstrip()
+            after=text[tokens[idx-1].end():].lstrip()
+            result.append((tuple(lines),int(not before or before[-1] in '.!?;:…'),int(not after or after[0] in '.!?;:…')))
+            if len(result)>=max_results: break
+    return result
 
 def setup(conn):
     conn.executescript('''
-        CREATE TABLE IF NOT EXISTS posts (post_id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS haikus (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          post_id INTEGER NOT NULL,
-          thread_id INTEGER NOT NULL,
-          posted_utc TEXT NOT NULL,
-          line1 TEXT NOT NULL, line2 TEXT NOT NULL, line3 TEXT NOT NULL,
-          source_url TEXT NOT NULL,
-          start_boundary INTEGER, end_boundary INTEGER,
-          UNIQUE(post_id, line1, line2, line3));
-        CREATE TABLE IF NOT EXISTS cache (url TEXT PRIMARY KEY, last_modified TEXT NOT NULL);
+       CREATE TABLE IF NOT EXISTS ah_posts(post_id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, seen_utc TEXT NOT NULL);
+       CREATE TABLE IF NOT EXISTS ah_cache(url TEXT PRIMARY KEY, modified TEXT, etag TEXT);
+       CREATE TABLE IF NOT EXISTS ah_batches(id INTEGER PRIMARY KEY, scanned_utc TEXT NOT NULL, scan_key INTEGER UNIQUE);
+       CREATE TABLE IF NOT EXISTS ah_candidates(id INTEGER PRIMARY KEY, batch_id INTEGER NOT NULL,
+         post_id INTEGER NOT NULL, thread_id INTEGER NOT NULL, posted_utc TEXT NOT NULL, original TEXT NOT NULL,
+         line1 TEXT NOT NULL,line2 TEXT NOT NULL,line3 TEXT NOT NULL, score REAL NOT NULL,
+         category TEXT NOT NULL, UNIQUE(post_id), FOREIGN KEY(batch_id) REFERENCES ah_batches(id));
+       CREATE TABLE IF NOT EXISTS ah_publications(slot TEXT PRIMARY KEY, candidate_id INTEGER UNIQUE,
+         post_id INTEGER UNIQUE, line1 TEXT NOT NULL,line2 TEXT NOT NULL,line3 TEXT NOT NULL,
+         original TEXT, published_utc TEXT NOT NULL, category TEXT NOT NULL);
+       CREATE TABLE IF NOT EXISTS ah_state(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+       CREATE INDEX IF NOT EXISTS ah_candidates_batch_idx ON ah_candidates(batch_id);
     ''')
-    existing = {row[1] for row in conn.execute('PRAGMA table_info(haikus)')}
-    for column in ('start_boundary', 'end_boundary'):
-        if column not in existing:
-            conn.execute(f'ALTER TABLE haikus ADD COLUMN {column} INTEGER')
 
-def store_posts(conn, posts, thread_id):
-    scanned, discovered = 0, 0
-    for p in posts:
-        pid = p.get('no')
-        if not isinstance(pid, int):
-            continue
+def api_get(conn, url, delay_state, timeout=18):
+    # Never exceed one request per second (including failures).
+    elapsed=time.monotonic()-delay_state[0]
+    if elapsed<1.1: time.sleep(1.1-elapsed)
+    existing=conn.execute('SELECT modified,etag FROM ah_cache WHERE url=?',(url,)).fetchone()
+    headers={'User-Agent':'Anonhaiku/2.0 (read-only poetry experiment)', 'Accept':'application/json'}
+    if existing:
+        if existing[0]: headers['If-Modified-Since']=existing[0]
+        if existing[1]: headers['If-None-Match']=existing[1]
+    delay_state[0]=time.monotonic()
+    try:
+        with urlopen(Request(url,headers=headers),timeout=timeout) as response:
+            body=json.load(response)
+            conn.execute('INSERT OR REPLACE INTO ah_cache VALUES(?,?,?)', (url,response.headers.get('Last-Modified'),response.headers.get('ETag')))
+            return body
+    except HTTPError as exc:
+        if exc.code in (304,404): return None
+        raise
 
-        # 4chan includes 'tim' for posts with an attached image or file.
-        # Skip those posts completely, even if the attachment was deleted.
-        if 'tim' in p or 'filedeleted' in p or 'filename' in p or 'ext' in p:
-            continue
+def eligible(post):
+    # 4chan's metadata marks images and other attachments. Also exclude deleted attachments.
+    if any(k in post for k in ATTACHMENT_FIELDS): return False
+    raw=post.get('com','')
+    if not raw or NUMBERS.search(clean_comment(raw)): return False
+    if URLS.search(clean_comment(raw)): return False
+    return True
 
-        comment = clean_comment(p.get('com', ''))
-        # Reject the whole original comment when it contains a digit.
-        if any(char.isdigit() for char in comment):
-            continue
-
-        cur = conn.execute(
-            'INSERT OR IGNORE INTO posts(post_id,thread_id) VALUES(?,?)',
-            (pid, thread_id),
-        )
-        if not cur.rowcount:
-            continue
-        scanned += 1
-
-        for lines, starts, ends in detect_with_boundaries(comment):
-            url = f'https://boards.4chan.org/b/thread/{thread_id}#p{pid}'
-            timestamp = datetime.fromtimestamp(
-                p.get('time', time.time()), timezone.utc
-            ).isoformat()
-            cur = conn.execute('''INSERT OR IGNORE INTO haikus
-              (post_id,thread_id,posted_utc,line1,line2,line3,source_url,start_boundary,end_boundary)
-              VALUES(?,?,?,?,?,?,?,?,?)''', (pid,thread_id,timestamp,*lines,url,starts,ends))
-            discovered += cur.rowcount
+def harvest(conn, scan_key, now, scorer):
+    """Returns (new_posts, total_candidates, errors); doesn't create a batch on total API failure."""
+    setup(conn)
+    if conn.execute('SELECT 1 FROM ah_batches WHERE scan_key=?',(scan_key,)).fetchone(): return (0,0,0)
+    state=[0.0]; errors=0
+    try:
+        catalog=api_get(conn,f'{API}/catalog.json',state)
+    except (HTTPError,URLError,TimeoutError,ValueError,OSError) as exc:
+        print('Catalog unavailable:',exc); return (0,0,1)
+    if not catalog:
+        print('Catalog unchanged; no new threads to inspect this run.')
+        return (0,0,0)
+    threads=list(dict.fromkeys(t['no'] for page in catalog for t in page.get('threads',[]) if isinstance(t.get('no'),int)))
+    potential=[]; newposts=0; successes=0
+    for thread_id in threads:
+        try:
+            data=api_get(conn,f'{API}/thread/{thread_id}.json',state)
+        except (HTTPError,URLError,TimeoutError,ValueError,OSError) as exc:
+            errors+=1; continue
+        successes+=1
+        if not data: continue
+        for post in data.get('posts',[]):
+            pid=post.get('no')
+            if not isinstance(pid,int) or conn.execute('SELECT 1 FROM ah_posts WHERE post_id=?',(pid,)).fetchone(): continue
+            conn.execute('INSERT INTO ah_posts VALUES(?,?,?)',(pid,thread_id,now.isoformat()))
+            newposts+=1
+            posted_at=datetime.fromtimestamp(post.get('time',int(now.timestamp())),timezone.utc)
+            if posted_at < now-timedelta(hours=12) or posted_at > now+timedelta(minutes=5): continue
+            if not eligible(post): continue
+            original=clean_comment(post['com'])
+            try:
+                picks=scorer(original)
+            except Exception as exc:
+                errors+=1; continue
+            if picks:
+                best=max(picks,key=lambda item:item['score'])
+                potential.append(dict(best,post_id=pid,thread_id=thread_id,original=original,
+                                      posted_utc=posted_at.isoformat()))
+    if not successes:
+        conn.commit(); return (newposts,0,max(1,errors))
+    # Max 3 distinct original posts, highest-quality candidates from the whole active board.
+    potential.sort(key=lambda c:(c['score'],c['posted_utc']),reverse=True)
+    batch=conn.execute('INSERT INTO ah_batches(scanned_utc,scan_key) VALUES(?,?)',(now.isoformat(),scan_key)).lastrowid
+    for c in potential[:3]:
+        conn.execute('''INSERT OR IGNORE INTO ah_candidates
+          (batch_id,post_id,thread_id,posted_utc,original,line1,line2,line3,score,category)
+          VALUES(?,?,?,?,?,?,?,?,?,?)''',
+          (batch,c['post_id'],c['thread_id'],c['posted_utc'],c['original'],*c['lines'],c['score'],c['category']))
     conn.commit()
-    return scanned, discovered
-
-class Client:
-    def __init__(self, conn):
-        self.conn = conn
-        self.last = 0.0
-    def get(self, url):
-        elapsed = time.monotonic() - self.last
-        if self.last and elapsed < 1.15:
-            time.sleep(1.15 - elapsed)
-        stored = self.conn.execute('SELECT last_modified FROM cache WHERE url=?', (url,)).fetchone()
-        headers = {'User-Agent': 'AnonhaikuResearchPrototype/0.2 (read-only haiku experiment)', 'Accept': 'application/json'}
-        if stored:
-            headers['If-Modified-Since'] = stored[0]
-        self.last = time.monotonic()
-        try:
-            with urlopen(Request(url, headers=headers), timeout=20) as response:
-                payload = json.load(response)
-                changed = response.headers.get('Last-Modified')
-                if changed:
-                    self.conn.execute('INSERT OR REPLACE INTO cache VALUES (?,?)', (url,changed))
-                    self.conn.commit()
-                return payload
-        except HTTPError as e:
-            if e.code in (304, 404):
-                return None
-            raise
-
-def live(conn, limit):
-    client = Client(conn)
-    index = client.get(API + '/threads.json')
-    if index is None:
-        print('Thread index unchanged; no new scans in this run.')
-        return
-    threads = [item['no'] for page in index for item in page['threads']]
-    scanned = hits = 0
-    for tid in threads[:limit]:
-        try:
-            thread = client.get(f'{API}/thread/{tid}.json')
-            if thread is None:
-                continue
-            a,b = store_posts(conn, thread.get('posts', []), tid)
-            scanned += a
-            hits += b
-        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-            print(f'Thread {tid}: {exc}')
-    print(f'New posts scanned: {scanned}; new candidate haikus: {hits}')
-
-def demo(conn):
-    sample = [
-      {'no': 100001, 'time': 1761470000, 'com': 'the old cat is here and the rain is falling on us it is a cold day'},
-      {'no': 100002, 'time': 1761470000, 'com': 'hello world this is just a test'},
-      {'no': 100003, 'time': 1761470000, 'com': 'the moon is so bright and the wind is blowing all night the sun will come soon'},
-    ]
-    n,k = store_posts(conn, sample, 999999)
-    print(f'Demo: {n} posts processed, {k} candidates. Example posts are invented, not sourced from 4chan.')
-
-def print_candidates(conn, limit, strict=True):
-    conn.row_factory = sqlite3.Row
-    if strict:
-        # Evaluate existing database candidates as well as new ones.
-        rows = conn.execute('SELECT * FROM haikus ORDER BY id DESC').fetchall()
-        records = best_candidates(rows, limit=limit)
-    else:
-        records = [dict(r) for r in conn.execute('SELECT * FROM haikus ORDER BY id DESC LIMIT ?', (limit,))]
-    if not records:
-        print('Geen geschikte kandidaat. Probeer meer threads of --all om de ruwe resultaten te bekijken.')
-    for r in records:
-        label = f"  Quality score: {r['score']} / heuristic" if strict else ''
-        print(f"\n{r['line1']}\n{r['line2']}\n{r['line3']}\n  Source: {r['source_url']}\n  Original timestamp (UTC): {r['posted_utc']}\n{label}")
-    if records:
-        print('\nATTENTION: Heuristic ranking is not AI quality assurance or safety moderation. Review before publishing.')
-
-
-def export_site(conn):
-    from site_builder import export_html
-    conn.row_factory = sqlite3.Row
-    candidates = best_candidates(conn.execute('SELECT * FROM haikus ORDER BY id DESC').fetchall(), limit=100)
-    outfile = Path(__file__).with_name('anonhaiku-preview.html')
-    export_html(outfile, candidates)
-    print(f'Websitevoorbeeld gemaakt: {outfile}')
-
-def main():
-    parser = argparse.ArgumentParser()
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument('--demo', action='store_true', help='Use invented test comments, without network')
-    mode.add_argument('--live', action='store_true', help='Read current public /b/ threads')
-    mode.add_argument('--review', action='store_true', help='Review all saved candidates without network')
-    parser.add_argument('--threads', type=int, default=8, help='Number of active threads to scan (default 8)')
-    parser.add_argument('--show', type=int, default=10, help='Candidates to print')
-    parser.add_argument('--all', action='store_true', help='Show raw unfiltered results')
-    parser.add_argument('--site', action='store_true', help='Make local HTML preview using filtered candidates')
-    args = parser.parse_args()
-    if args.threads < 1 or args.threads > 100:
-        parser.error('--threads must be between 1 and 100')
-    with sqlite3.connect(DB) as conn:
-        setup(conn)
-        if args.demo:
-            demo(conn)
-        elif args.live:
-            live(conn, args.threads)
-        print_candidates(conn, args.show, strict=not args.all)
-        if args.site:
-            export_site(conn)
-
-if __name__ == '__main__':
-    main()
+    print(f'Active threads: {len(threads)}; new posts: {newposts}; shortlist: {min(3,len(potential))}; request errors: {errors}')
+    return newposts,len(potential),errors
