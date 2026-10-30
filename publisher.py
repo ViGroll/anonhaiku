@@ -48,17 +48,16 @@ def old_history(conn):
     result=list(conn.execute('SELECT post_id,line1,line2,line3 FROM ah_publications'))
     return result
 
-def choose(conn,slot):
-    """Select one from the 4 most recent scan batches within previous publication window."""
+def choose(conn,slot,now=None):
+    """Choose a recent, unpublished candidate; don't arbitrarily limit scan batches."""
     conn.row_factory=sqlite3.Row
+    now=now or datetime.now(UTC)
+    # Catch-up runs may happen after the nominal slot: accept the current scan.
     since=previous_slot(slot)
-    # scans from (previous publication, current publication] only, no multi-day leftovers
-    batches=conn.execute('''SELECT id FROM ah_batches WHERE scanned_utc>? AND scanned_utc<=?
-      ORDER BY scanned_utc DESC LIMIT 4''',(since.isoformat(),slot.isoformat())).fetchall()
-    if not batches: return None
-    ids=[b['id'] for b in batches]
-    marks=','.join('?' for _ in ids)
-    records=conn.execute(f'SELECT * FROM ah_candidates WHERE batch_id IN ({marks}) ORDER BY score DESC',ids).fetchall()
+    records=conn.execute("""SELECT c.* FROM ah_candidates c
+        JOIN ah_batches b ON b.id=c.batch_id
+        WHERE b.scanned_utc>? AND b.scanned_utc<=?
+        ORDER BY c.score DESC""",(since.isoformat(),now.isoformat())).fetchall()
     published=old_history(conn)
     desired=CATEGORIES[len(published)%3]
     picks=[]
@@ -70,13 +69,14 @@ def choose(conn,slot):
         scores=category_counts(lines)
         priority=(int(scores[desired]>0),row['score']+scores[desired]*18,row['posted_utc'])
         picks.append((priority,dict(row)))
+    print(f'Publication pool: {len(records)} recent candidates; {len(picks)} unique eligible; preferred category: {desired}',flush=True)
     return max(picks,key=lambda x:x[0])[1] if picks else None
 
 def maybe_publish(conn,now):
     slot=slot_for(now)
     if conn.execute('SELECT 1 FROM ah_publications WHERE slot=?',(slot.isoformat(),)).fetchone():
         print('Already published this slot.');return False
-    chosen=choose(conn,slot)
+    chosen=choose(conn,slot,now)
     if chosen is None:
         print('No fresh eligible candidate. Keep previous homepage.');return False
     old_count=conn.execute('SELECT COUNT(*) FROM ah_publications').fetchone()[0]
@@ -101,11 +101,20 @@ def run(now=None,scan=True,publish=True):
         setup(conn)
         imported=legacy_import(conn)
         if imported: print('Imported legacy published poems:',imported)
-        # Publish BEFORE scanning, so current-slot fresh scans cannot be used in the previous window.
-        if publish: maybe_publish(conn,now)
-        if scan and due_scan(conn,now):
+        # Always scan first, so a newly populated shortlist can publish immediately.
+        slot=slot_for(now)
+        published_this_slot=bool(conn.execute('SELECT 1 FROM ah_publications WHERE slot=?',(slot.isoformat(),)).fetchone())
+        scan_due=due_scan(conn,now)
+        if scan and (scan_due or (publish and not published_this_slot)):
+            # Do not let an empty shortlist block the next scheduled publication.
             scan_key=int(now.timestamp()//SCAN_SECONDS)
-            harvest(conn,scan_key,now,score_comment)
+            if not scan_due:
+                print('Attempting catch-up scan for unfilled publication slot.',flush=True)
+            newposts,candidates,errors=harvest(conn,scan_key,now,score_comment)
+            print(f'Scan summary: new posts={newposts}; potential candidates={candidates}; request errors={errors}',flush=True)
+        elif scan:
+            print('Scan not due yet.',flush=True)
+        if publish: maybe_publish(conn,now)
         # After startup, always regenerate even if no new candidate.
         build(conn,DOCS)
 
