@@ -79,13 +79,13 @@ def setup(conn):
        CREATE INDEX IF NOT EXISTS ah_candidates_batch_idx ON ah_candidates(batch_id);
     ''')
 
-def api_get(conn, url, delay_state, timeout=18):
+def api_get(conn, url, delay_state, timeout=18, use_cache=True):
     # Never exceed one request per second (including failures).
     elapsed=time.monotonic()-delay_state[0]
     if elapsed<1.1: time.sleep(1.1-elapsed)
     existing=conn.execute('SELECT modified,etag FROM ah_cache WHERE url=?',(url,)).fetchone()
     headers={'User-Agent':'Anonhaiku/2.0 (read-only poetry experiment)', 'Accept':'application/json'}
-    if existing:
+    if existing and use_cache:
         if existing[0]: headers['If-Modified-Since']=existing[0]
         if existing[1]: headers['If-None-Match']=existing[1]
     delay_state[0]=time.monotonic()
@@ -112,21 +112,24 @@ def harvest(conn, scan_key, now, scorer):
     if conn.execute('SELECT 1 FROM ah_batches WHERE scan_key=?',(scan_key,)).fetchone(): return (0,0,0)
     state=[0.0]; errors=0
     try:
-        catalog=api_get(conn,f'{API}/catalog.json',state)
+        catalog=api_get(conn,f'{API}/catalog.json',state,use_cache=False)
     except (HTTPError,URLError,TimeoutError,ValueError,OSError) as exc:
         print('Catalog unavailable:',exc); return (0,0,1)
     if not catalog:
-        print('Catalog unchanged; no new threads to inspect this run.')
+        print('Catalog unavailable or empty; scan not marked complete.')
         return (0,0,0)
     threads=list(dict.fromkeys(t['no'] for page in catalog for t in page.get('threads',[]) if isinstance(t.get('no'),int)))
-    potential=[]; newposts=0; successes=0
+    print(f'Scan started: {now.isoformat()}; active threads: {len(threads)}', flush=True)
+    potential=[]; newposts=0; successes=0; unchanged=0
     for thread_id in threads:
         try:
             data=api_get(conn,f'{API}/thread/{thread_id}.json',state)
         except (HTTPError,URLError,TimeoutError,ValueError,OSError) as exc:
             errors+=1; continue
         successes+=1
-        if not data: continue
+        if not data:
+            unchanged+=1
+            continue
         for post in data.get('posts',[]):
             pid=post.get('no')
             if not isinstance(pid,int) or conn.execute('SELECT 1 FROM ah_posts WHERE post_id=?',(pid,)).fetchone(): continue
@@ -155,5 +158,5 @@ def harvest(conn, scan_key, now, scorer):
           VALUES(?,?,?,?,?,?,?,?,?,?)''',
           (batch,c['post_id'],c['thread_id'],c['posted_utc'],c['original'],*c['lines'],c['score'],c['category']))
     conn.commit()
-    print(f'Active threads: {len(threads)}; new posts: {newposts}; shortlist: {min(3,len(potential))}; request errors: {errors}')
+    print(f'Active threads: {len(threads)}; checked threads: {successes}; unchanged threads: {unchanged}; new posts: {newposts}; valid source candidates: {len(potential)}; shortlist saved: {min(3,len(potential))}; request errors: {errors}',flush=True)
     return newposts,len(potential),errors
