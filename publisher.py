@@ -83,7 +83,7 @@ def maybe_publish(conn,now):
     conn.execute('''INSERT INTO ah_publications
       (slot,candidate_id,post_id,line1,line2,line3,original,published_utc,category)
       VALUES(?,?,?,?,?,?,?,?,?)''',
-      (slot.isoformat(),chosen['id'],chosen['post_id'],chosen['line1'],chosen['line2'],chosen['line3'],chosen['original'],now.isoformat(),CATEGORIES[old_count%3]))
+      (slot.isoformat(),None,chosen['post_id'],chosen['line1'],chosen['line2'],chosen['line3'],chosen['original'],now.isoformat(),CATEGORIES[old_count%3]))
     # Remove all candidates in previous window: no old fragments can leak to future publication.
     conn.execute('DELETE FROM ah_candidates WHERE batch_id IN (SELECT id FROM ah_batches WHERE scanned_utc<=?)',(now.isoformat(),))
     conn.commit()
